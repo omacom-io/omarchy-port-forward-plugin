@@ -29,6 +29,7 @@ Panel {
   readonly property string glyphDelete: "󰆴"     // trash
   readonly property string glyphAdd: "󰐕"        // plus-circle
   readonly property string glyphPower: "󰐥"      // power
+  readonly property string glyphKey: "󰌋"        // key — pending auth / trust host key
 
   // Keyboard cursor over the list. Index 0..forwards.length-1 are forward
   // rows; index === forwards.length is the "Add forward" row.
@@ -165,6 +166,7 @@ Panel {
   function statusColor(status) {
     if (status === "active") return foreground
     if (status === "connecting") return Qt.lighter(dim, 1.2)
+    if (status === "auth") return urgent
     if (status === "error") return urgent
     return dim
   }
@@ -172,6 +174,7 @@ Panel {
   function statusGlyph(status) {
     if (status === "active") return "●"
     if (status === "connecting") return "◐"
+    if (status === "auth") return "◉"
     if (status === "error") return "✕"
     return "○"
   }
@@ -211,7 +214,7 @@ Panel {
       var out = {}
       for (var i = 0; i < svc.forwards.length; i++) {
         var f = svc.forwards[i]
-        out[f.id] = { label: svc.forwardTitle(f), localPort: f.localPort, status: svc.statusOf(f.id) }
+        out[f.id] = { label: svc.forwardTitle(f), localPort: f.localPort, status: svc.statusOf(f.id), authUrl: svc.authUrlOf(f.id) }
       }
       return JSON.stringify(out)
     }
@@ -271,7 +274,9 @@ Panel {
       text: root.iconGlyph
       font.family: root.fontFamily
       font.pixelSize: Style.font.icon
-      color: svc.activeCount > 0 ? root.barForegroundColor : Qt.darker(root.barForegroundColor, 1.55)
+      color: svc.authCount > 0 ? root.urgent
+           : svc.activeCount > 0 ? root.barForegroundColor
+           : Qt.darker(root.barForegroundColor, 1.55)
     }
 
     MouseArea {
@@ -349,13 +354,14 @@ Panel {
             }
           }
 
-          // Status / error line ---------------------------------------------
+          // Status / error / attention line -----------------------------------
           Text {
             readonly property string headerError: (svc.statusRevision, svc.currentErrorText())
-            visible: svc.notice !== "" || headerError !== ""
+            readonly property string headerAuth: (svc.statusRevision, svc.currentAuthText())
+            visible: svc.notice !== "" || headerError !== "" || headerAuth !== ""
             width: parent.width
-            text: svc.notice !== "" ? svc.notice : headerError
-            color: (headerError !== "" && svc.notice === "") ? root.urgent : root.dim
+            text: svc.notice !== "" ? svc.notice : (headerError !== "" ? headerError : headerAuth)
+            color: (svc.notice === "" && (headerError !== "" || headerAuth !== "")) ? root.urgent : root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
             wrapMode: Text.WordWrap
@@ -656,7 +662,10 @@ Panel {
     property int rowIdx: 0
     readonly property string fid: forward ? String(forward.id) : ""
     readonly property string status: (svc.statusRevision, forward ? svc.statusOf(fid) : "inactive")
-    readonly property bool activeState: status === "active" || status === "connecting"
+    readonly property string hostKeyIssue: (svc.statusRevision, forward ? svc.hostKeyIssueOf(fid) : "")
+    readonly property bool activeState: status === "active" || status === "connecting" || status === "auth"
+    readonly property bool needsAuth: status === "auth"
+    readonly property bool canTrustHostKey: status === "error" && hostKeyIssue === "new"
 
     hasCursor: root.cursorActive && !root.formMode && root.rowIndex === rowIdx
     current: activeState
@@ -673,7 +682,13 @@ Panel {
       hoverEnabled: true
       cursorShape: Qt.PointingHandCursor
       onContainsMouseChanged: if (containsMouse) root.setRowCursor(fwdRow.rowIdx)
-      onClicked: if (fwdRow.forward) svc.toggle(fwdRow.forward)
+      onClicked: {
+        if (!fwdRow.forward) return
+        // A row waiting on approval opens the approval page; the power
+        // button remains the way to give up and turn it off.
+        if (fwdRow.needsAuth) svc.openAuth(fwdRow.fid)
+        else svc.toggle(fwdRow.forward)
+      }
     }
 
     RowLayout {
@@ -690,12 +705,13 @@ Panel {
         font.family: root.fontFamily
         font.pixelSize: Style.font.body
         Layout.alignment: Qt.AlignVCenter
-        // Gentle pulse while a tunnel is establishing. Base opacity is bound
-        // to status so it restores to full once the animation stops.
-        opacity: fwdRow.status === "connecting" ? 0.999 : 1.0
+        // Gentle pulse while a tunnel is establishing or waiting on the user
+        // to approve. Base opacity is bound to status so it restores to full
+        // once the animation stops.
+        opacity: (fwdRow.status === "connecting" || fwdRow.needsAuth) ? 0.999 : 1.0
 
         SequentialAnimation on opacity {
-          running: fwdRow.status === "connecting"
+          running: fwdRow.status === "connecting" || fwdRow.needsAuth
           loops: Animation.Infinite
           NumberAnimation { to: 0.3; duration: 650; easing.type: Easing.InOutQuad }
           NumberAnimation { to: 1.0; duration: 650; easing.type: Easing.InOutQuad }
@@ -719,11 +735,27 @@ Panel {
 
         Text {
           Layout.fillWidth: true
-          text: fwdRow.status === "error" ? svc.errorOf(fwdRow.fid) : svc.forwardSubtitle(fwdRow.forward)
-          color: fwdRow.status === "error" ? root.urgent : root.dim
+          text: fwdRow.status === "error" ? svc.errorOf(fwdRow.fid)
+              : fwdRow.needsAuth ? "Approval required — click to open the authentication page"
+              : svc.forwardSubtitle(fwdRow.forward)
+          color: (fwdRow.status === "error" || fwdRow.needsAuth) ? root.urgent : root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
           elide: Text.ElideRight
+        }
+      }
+
+      PanelActionButton {
+        visible: fwdRow.needsAuth || fwdRow.canTrustHostKey
+        iconText: root.glyphKey
+        tooltipText: fwdRow.needsAuth ? "Open authentication page" : "Trust host key & retry"
+        foreground: root.foreground
+        hoverColor: root.urgent
+        fontFamily: root.fontFamily
+        Layout.alignment: Qt.AlignVCenter
+        onClicked: {
+          if (fwdRow.needsAuth) svc.openAuth(fwdRow.fid)
+          else if (fwdRow.forward) svc.trustAndRetry(fwdRow.forward)
         }
       }
 

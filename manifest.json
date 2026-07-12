@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "port-forward",
   "name": "Port Forwarding",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "Ryan Hughes",
   "license": "MIT",
   "description": "Manage SSH port forwards from the Omarchy bar: toggle tunnels on/off, edit destinations, and bounce a local port between remote hosts without keeping a terminal open.",

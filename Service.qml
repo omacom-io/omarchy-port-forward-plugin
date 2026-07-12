@@ -16,9 +16,18 @@ import qs.Commons
 //
 // systemd is the source of truth for liveness. We poll it (plus an `ss` check
 // that the local port is really listening) and derive a status per forward:
-// "inactive" | "connecting" | "active" | "error". `statusRevision` bumps on
-// every change so QML rows can force a re-read of the plain `statuses` map,
-// which QML does not deep-observe on its own.
+// "inactive" | "connecting" | "auth" | "active" | "error". `statusRevision`
+// bumps on every change so QML rows can force a re-read of the plain
+// `statuses` map, which QML does not deep-observe on its own.
+//
+// "auth" covers the case where ssh is alive but blocked on an out-of-band
+// step the user must complete — in practice Tailscale SSH's check mode, which
+// prints "To authenticate, visit: https://login.tailscale.com/..." to stderr
+// and waits. That lands in the unit's journal, so the poll greps the CURRENT
+// invocation for the URL and we surface it as a click-to-open action. Host
+// key problems are the other prompt-shaped failure: BatchMode makes them fail
+// fast, and we classify them (new vs CHANGED key) so the UI can offer
+// "trust & retry" for new keys while never auto-trusting a changed one.
 Item {
   id: root
 
@@ -33,8 +42,11 @@ Item {
   // Runtime state, keyed by forward id.
   property var statuses: ({})
   property var errors: ({})
+  property var authUrls: ({})      // id -> pending approval URL (Tailscale check mode)
+  property var hostKeyIssues: ({}) // id -> "new" | "changed"
   property int statusRevision: 0
   property int activeCount: 0
+  property int authCount: 0
 
   // Transient one-line status shown in the panel header.
   property string notice: ""
@@ -49,6 +61,15 @@ Item {
     return ""
   }
 
+  // Header attention line for forwards blocked on user approval.
+  function currentAuthText() {
+    for (var i = 0; i < forwards.length; i++) {
+      var id = String(forwards[i].id)
+      if (statusOf(id) === "auth") return forwardTitle(forwards[i]) + ": approval required — click the key icon to authenticate"
+    }
+    return ""
+  }
+
   property bool _autostarted: false
   property int _idCounter: 0
   property var _startedAt: ({}) // id -> ms, grace window so a just-started forward reads "connecting"
@@ -57,7 +78,9 @@ Item {
 
   function statusOf(id) { return statuses[String(id)] || "inactive" }
   function errorOf(id) { return errors[String(id)] || "" }
-  function isActive(id) { var s = statusOf(id); return s === "active" || s === "connecting" }
+  function authUrlOf(id) { return authUrls[String(id)] || "" }
+  function hostKeyIssueOf(id) { return hostKeyIssues[String(id)] || "" }
+  function isActive(id) { var s = statusOf(id); return s === "active" || s === "connecting" || s === "auth" }
 
   function findForward(id) {
     var key = String(id)
@@ -186,7 +209,7 @@ Item {
 
   // --- tunnels (systemd transient units) -----------------------------------
 
-  function forwardCommand(f) {
+  function forwardCommand(f, trustHostKey) {
     var rh = (f.remoteHost && String(f.remoteHost).length) ? String(f.remoteHost) : "localhost"
     var spec = f.localPort + ":" + rh + ":" + f.remotePort
     var cmd = ["ssh", "-N", "-T",
@@ -196,6 +219,9 @@ Item {
       "-o", "ServerAliveCountMax=3",
       "-o", "ConnectTimeout=10",
       "-L", spec]
+    // One-shot opt-in from the "Trust host key & retry" action. accept-new
+    // records unknown hosts but still hard-fails if a known key CHANGED.
+    if (trustHostKey === true) cmd.push("-o", "StrictHostKeyChecking=accept-new")
     var extra = String(f.extraOptions || "").trim()
     if (extra !== "") {
       var parts = extra.split(/\s+/)
@@ -205,11 +231,11 @@ Item {
     return cmd
   }
 
-  function start(f) {
+  function start(f, trustHostKey) {
     if (!f) return
     if (!sshAvailable) { flash("ssh is not installed or not on PATH"); return }
     var unit = unitName(f.id)
-    var ssh = forwardCommand(f)
+    var ssh = forwardCommand(f, trustHostKey === true)
     var quoted = ssh.map(function(a) { return Util.shellQuote(a) }).join(" ")
     var desc = "omarchy port forward: " + forwardTitle(f)
 
@@ -264,6 +290,24 @@ Item {
     else start(f)
   }
 
+  // Open the pending approval URL (e.g. Tailscale check) in the browser. The
+  // waiting ssh proceeds on its own once the user approves; the next poll
+  // flips the row to "active".
+  function openAuth(id) {
+    var url = authUrlOf(id)
+    if (url === "") return
+    Qt.openUrlExternally(url)
+    flash("Opened approval page — finish in the browser, the tunnel resumes automatically")
+  }
+
+  // Retry a forward that failed on an unknown host key, accepting it this
+  // time (TOFU). Never offered for a CHANGED key.
+  function trustAndRetry(f) {
+    if (!f) return
+    flash("Accepting new host key and retrying…")
+    start(f, true)
+  }
+
   // --- polling / status ----------------------------------------------------
 
   function schedulePoll(delayMs) {
@@ -279,7 +323,12 @@ Item {
       return
     }
     // One shell round-trip reports every forward's systemd state, whether its
-    // local port is listening, and (for failed units) a base64 error line.
+    // local port is listening, plus (failed units) a base64 error line and a
+    // host-key classification, and (running-but-not-listening units) any
+    // approval URL ssh printed to stderr. Journal reads are scoped to the
+    // unit's CURRENT invocation where possible so a stale URL or error from a
+    // previous run is never resurfaced. "-" is the empty-field placeholder so
+    // the line always splits into six columns.
     var specs = []
     for (var i = 0; i < forwards.length; i++) {
       specs.push(Util.shellQuote(forwards[i].id + "|" + unitName(forwards[i].id) + "|" + forwards[i].localPort))
@@ -289,11 +338,19 @@ Item {
       'IFS="|" read -r id unit port <<< "$e"; ' +
       'state=$(systemctl --user is-active "$unit" 2>/dev/null); ' +
       'listen=no; ss -Hltn 2>/dev/null | grep -q ":$port " && listen=yes; ' +
-      'msg=; ' +
+      'msg=-; hk=-; url=-; ' +
+      'inv=$(systemctl --user show -p InvocationID --value "$unit" 2>/dev/null); ' +
       'if [ "$state" = failed ]; then ' +
-      "msg=$(journalctl --user -u \"$unit\" --no-pager -n 30 -o cat 2>/dev/null | grep -iE 'ssh:|bind|cannot|denied|refused|timed out|could not|already in use|forbidden|no route' | tail -1 | base64 -w0); " +
+      'j=$(journalctl --user -u "$unit" ${inv:+_SYSTEMD_INVOCATION_ID=$inv} --no-pager -n 200 -o cat 2>/dev/null); ' +
+      'if printf %s "$j" | grep -q "IDENTIFICATION HAS CHANGED"; then hk=changed; ' +
+      'elif printf %s "$j" | grep -qi "host key verification failed"; then hk=new; fi; ' +
+      'm=$(printf %s "$j" | grep -iE "ssh:|bind|cannot|denied|refused|timed out|could not|already in use|forbidden|no route|host key|authentication" | tail -1 | base64 -w0); ' +
+      '[ -n "$m" ] && msg=$m; ' +
+      'elif [ "$state" = active ] && [ "$listen" = no ]; then ' +
+      'u=$(journalctl --user -u "$unit" ${inv:+_SYSTEMD_INVOCATION_ID=$inv} --no-pager -o cat 2>/dev/null | grep -oE "https://login[.]tailscale[.]com/[A-Za-z0-9/_.-]+" | tail -1); ' +
+      '[ -n "$u" ] && url=$u; ' +
       'fi; ' +
-      'echo "$id ${state:-unknown} $listen $msg"; ' +
+      'echo "$id ${state:-unknown} $listen $msg $hk $url"; ' +
       'done'
     pollProc.command = ["bash", "-c", script]
     pollProc.running = true
@@ -303,6 +360,8 @@ Item {
     var lines = String(text || "").split("\n")
     var newStatus = {}
     var newErr = {}
+    var newAuth = {}
+    var newHk = {}
     var now = Date.now()
     for (var i = 0; i < lines.length; i++) {
       var line = lines[i].trim()
@@ -311,18 +370,30 @@ Item {
       var id = parts[0]
       var state = parts[1] || "unknown"
       var listen = parts[2] === "yes"
-      var msgB64 = parts[3] || ""
+      var msgB64 = (parts[3] && parts[3] !== "-") ? parts[3] : ""
+      var hk = (parts[4] && parts[4] !== "-") ? parts[4] : ""
+      var url = (parts[5] && parts[5] !== "-") ? parts[5] : ""
       var status = "inactive"
-      if (state === "active") status = listen ? "active" : "connecting"
+      if (state === "active") {
+        if (listen) status = "active"
+        else if (url !== "") status = "auth" // ssh is waiting on out-of-band approval
+        else status = "connecting"
+      }
       else if (state === "activating" || state === "reloading") status = "connecting"
       else if (state === "failed") status = "error"
       else status = "inactive"
       // Grace window: a just-started tunnel may not be registered yet.
       if (status === "inactive" && _startedAt[id] && (now - _startedAt[id]) < 4000) status = "connecting"
-      if (status === "error") newErr[id] = Util.decodeBase64(msgB64) || "ssh forwarding failed"
+      if (status === "auth") newAuth[id] = url
+      if (hk !== "") newHk[id] = hk
+      if (status === "error") {
+        if (hk === "changed") newErr[id] = "Host key CHANGED — possible MITM; verify and fix ~/.ssh/known_hosts"
+        else if (hk === "new") newErr[id] = "Host key not trusted yet"
+        else newErr[id] = Util.decodeBase64(msgB64) || "ssh forwarding failed"
+      }
       newStatus[id] = status
     }
-    _commit(newStatus, newErr)
+    _commit(newStatus, newErr, newAuth, newHk)
     _maybeAutostart()
   }
 
@@ -340,15 +411,24 @@ Item {
     var s = Object.assign({}, statuses); s[key] = status
     var e = Object.assign({}, errors)
     if (err && err !== "") e[key] = err; else delete e[key]
-    _commit(s, e)
+    var a = Object.assign({}, authUrls); delete a[key]
+    var h = Object.assign({}, hostKeyIssues); delete h[key]
+    _commit(s, e, a, h)
   }
 
-  function _commit(newStatus, newErr) {
+  function _commit(newStatus, newErr, newAuth, newHk) {
     statuses = newStatus
     errors = newErr
+    authUrls = newAuth || {}
+    hostKeyIssues = newHk || {}
     var count = 0
-    for (var k in newStatus) if (newStatus[k] === "active" || newStatus[k] === "connecting") count += 1
+    var auths = 0
+    for (var k in newStatus) {
+      if (newStatus[k] === "active" || newStatus[k] === "connecting" || newStatus[k] === "auth") count += 1
+      if (newStatus[k] === "auth") auths += 1
+    }
     activeCount = count
+    authCount = auths
     statusRevision += 1
   }
 
