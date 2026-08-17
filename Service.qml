@@ -107,8 +107,12 @@ Item {
     if (target === "") return null
     var rp = parseInt(raw.remotePort, 10)
     if (!isFinite(rp) || rp <= 0) rp = lp
+    // Ids travel through a `id|unit|port` pipe/space-separated line protocol
+    // in the poll round-trip, so a hand-edited id with whitespace or `|`
+    // would desync every forward's status. Keep them to safe characters.
+    var id = String(raw.id || "").trim().replace(/[^A-Za-z0-9._-]/g, "_")
     return {
-      id: String(raw.id || "").trim() || genId(),
+      id: id || genId(),
       label: String(raw.label || "").trim(),
       localPort: lp,
       sshTarget: target,
@@ -195,7 +199,7 @@ Item {
     forwards = next
     save()
     changed()
-    if (wasActive && updated) { stop(key); start(updated) } // re-establish with new destination
+    if (wasActive && updated) start(updated) // start() stops the old unit itself, sequenced
     return true
   }
 
@@ -239,31 +243,30 @@ Item {
     var quoted = ssh.map(function(a) { return Util.shellQuote(a) }).join(" ")
     var desc = "omarchy port forward: " + forwardTitle(f)
 
-    // Stop any other active forward on the same local port FIRST, in the same
-    // command, and wait for the port to actually free before binding the new
-    // tunnel — otherwise bouncing a port between hosts races on the bind.
-    var stopPart = ""
-    var conflicts = []
+    // Everything runs as ONE sequenced shell command: stop every unit that
+    // could hold the port — the forward's own unit (restart after an edit, or
+    // an IPC re-start) plus any other active forward bound to the same local
+    // port — wait for the port to actually free, then bind the new tunnel.
+    // Sequencing it in one command is what makes restart and port-bouncing
+    // race-free: two detached processes (stop, then run) have no ordering
+    // guarantee, and systemd-run fails outright if the old unit still exists.
+    var units = [Util.shellQuote(unit)]
     for (var i = 0; i < forwards.length; i++) {
       var other = forwards[i]
       if (String(other.id) === String(f.id)) continue
       if (other.localPort === f.localPort && isActive(other.id)) {
-        conflicts.push(Util.shellQuote(unitName(other.id)))
+        units.push(Util.shellQuote(unitName(other.id)))
         _setOne(other.id, "inactive", "")
       }
     }
-    if (conflicts.length > 0) {
-      var q = conflicts.join(" ")
-      stopPart = "systemctl --user stop " + q + " 2>/dev/null; systemctl --user reset-failed " + q + " 2>/dev/null; "
-               + "for i in $(seq 1 40); do ss -Hltn 2>/dev/null | grep -q ':" + f.localPort + " ' || break; sleep 0.1; done; "
-    }
-
     // reset-failed clears any prior failed unit of the same name; systemd-run
     // then registers the tunnel as a fresh transient service. No --collect: a
     // failed unit must linger in "failed" state long enough for us to read its
     // error; reset-failed (here and on stop) cleans it up.
-    var cmd = stopPart
-            + "systemctl --user reset-failed " + Util.shellQuote(unit) + " 2>/dev/null; "
+    var q = units.join(" ")
+    var cmd = "systemctl --user stop " + q + " 2>/dev/null; "
+            + "systemctl --user reset-failed " + q + " 2>/dev/null; "
+            + "for i in $(seq 1 40); do ss -Hltn 2>/dev/null | grep -q ':" + f.localPort + " ' || break; sleep 0.1; done; "
             + "exec systemd-run --user --unit=" + Util.shellQuote(unit)
             + " --description=" + Util.shellQuote(desc)
             + " -- " + quoted
@@ -393,6 +396,15 @@ Item {
       }
       newStatus[id] = status
     }
+    // Drop grace-window entries once a forward settles (or is deleted) so the
+    // map doesn't accumulate stale timestamps across many start cycles.
+    var started = Object.assign({}, _startedAt)
+    var pruned = false
+    for (var k in started) {
+      var st = newStatus[k]
+      if (st === undefined || st === "active" || st === "error") { delete started[k]; pruned = true }
+    }
+    if (pruned) _startedAt = started
     _commit(newStatus, newErr, newAuth, newHk)
     _maybeAutostart()
   }
@@ -463,7 +475,7 @@ Item {
 
   Process {
     id: whichSsh
-    command: ["which", "ssh"]
+    command: ["sh", "-c", "command -v ssh"]
     running: false
     onExited: function(code) { root.sshAvailable = (code === 0) }
   }
