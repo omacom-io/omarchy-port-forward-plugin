@@ -3,6 +3,8 @@
 A little bar widget for managing SSH port forwards without keeping a terminal
 open. Define forwards once, then flip them on/off from the bar.
 
+![The port forwarding panel](preview.png)
+
 ## Install
 
 ```
