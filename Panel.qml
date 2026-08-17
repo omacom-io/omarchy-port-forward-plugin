@@ -221,7 +221,9 @@ Panel {
     function on(ref: string): string {
       var f = svc.ipcForwardByRef(ref)
       if (!f) return "unknown"
-      svc.start(f)
+      // Already up (or coming up): leave the live tunnel alone instead of
+      // bouncing it — scripts use `on` to mean "ensure", not "restart".
+      if (!svc.isActive(f.id)) svc.start(f)
       return "ok"
     }
     function off(ref: string): string {
@@ -312,11 +314,13 @@ Panel {
       }
       onActivateRequested: if (root.cursorActive) root.activateCursor()
       onCloseRequested: root.close()
-      onDeleteRequested: { var f = root.selectedForward(); if (f) root.requestDelete(f) }
+      // Reveal the cursor before acting so the row the key targets is the row
+      // the user can see selected (rowIndex defaults to 0 on open).
+      onDeleteRequested: { root.cursorActive = true; var f = root.selectedForward(); if (f) root.requestDelete(f) }
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) {
         if (t === "a" || t === "A") root.openAddForm()
-        else if (t === "e" || t === "E") { var f = root.selectedForward(); if (f) root.openEditForm(f) }
+        else if (t === "e" || t === "E") { root.cursorActive = true; var f = root.selectedForward(); if (f) root.openEditForm(f) }
         else if (t === "r" || t === "R") svc.refresh()
       }
 
@@ -361,6 +365,9 @@ Panel {
             visible: svc.notice !== "" || headerError !== "" || headerAuth !== ""
             width: parent.width
             text: svc.notice !== "" ? svc.notice : (headerError !== "" ? headerError : headerAuth)
+            // Error text quotes the remote server's stderr — never let Qt
+            // auto-detect markup in it.
+            textFormat: Text.PlainText
             color: (svc.notice === "" && (headerError !== "" || headerAuth !== "")) ? root.urgent : root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
@@ -738,6 +745,8 @@ Panel {
           text: fwdRow.status === "error" ? svc.errorOf(fwdRow.fid)
               : fwdRow.needsAuth ? "Approval required — click to open the authentication page"
               : svc.forwardSubtitle(fwdRow.forward)
+          // Error text quotes the remote server's stderr — plain text only.
+          textFormat: Text.PlainText
           color: (fwdRow.status === "error" || fwdRow.needsAuth) ? root.urgent : root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
