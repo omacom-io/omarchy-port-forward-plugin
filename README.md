@@ -3,6 +3,20 @@
 A little bar widget for managing SSH port forwards without keeping a terminal
 open. Define forwards once, then flip them on/off from the bar.
 
+## Install
+
+```
+omarchy plugin add https://github.com/omacom-io/omarchy-port-forward-plugin.git --enable
+```
+
+Enable/disable later, or remove entirely, with:
+
+```
+omarchy plugin enable port-forward --section right
+omarchy plugin disable port-forward
+omarchy plugin remove port-forward
+```
+
 Each tunnel runs inside a **transient systemd user service**
 (`omarchy-pf-<id>.service`, launched with `systemd-run --user`), not as a child
 of the shell. That means a tunnel **survives a shell reload or crash** — and on
@@ -25,7 +39,9 @@ colliding with a retry. No `ssh -L …` terminal to babysit.
 Each forward is: an optional label, a local port, an SSH host (any name from
 `~/.ssh/config`, or `user@host`), a remote bind host (default `localhost`), a
 remote port, an optional autostart flag, and optional extra `ssh` options
-(e.g. `-J bastion`).
+(e.g. `-J bastion`). Extra options are split on whitespace — an option that
+needs embedded spaces (like a quoted `ProxyCommand`) belongs in
+`~/.ssh/config` instead.
 
 The underlying command is:
 
@@ -93,23 +109,24 @@ journalctl --user -u omarchy-pf-<id>
 - `ss` (iproute2) for the "is the port listening yet" readiness check
 - Non-interactive SSH auth to your hosts (key + agent)
 
-## IPC (scriptable from a keybind or `omarchy-shell`)
+Because tunnels run as systemd user units, ssh sees the *user manager's*
+environment, not your terminal's — `SSH_AUTH_SOCK` must be imported there for
+agent auth to work. Omarchy sessions (uwsm) already do this; on a session that
+doesn't, run `systemctl --user import-environment SSH_AUTH_SOCK`.
+
+## IPC (scriptable from a keybind)
 
 ```
-quickshell ipc -p $OMARCHY_PATH/shell call port-forward open
-quickshell ipc -p $OMARCHY_PATH/shell call port-forward list
-quickshell ipc -p $OMARCHY_PATH/shell call port-forward statuses
-quickshell ipc -p $OMARCHY_PATH/shell call port-forward on <id|label|localPort>
-quickshell ipc -p $OMARCHY_PATH/shell call port-forward off <id|label|localPort>
-quickshell ipc -p $OMARCHY_PATH/shell call port-forward toggleForward <id|label|localPort>
+omarchy-shell port-forward open
+omarchy-shell port-forward list
+omarchy-shell port-forward statuses
+omarchy-shell port-forward on <id|label|localPort>
+omarchy-shell port-forward off <id|label|localPort>
+omarchy-shell port-forward toggleForward <id|label|localPort>
 ```
 
-## Add / remove from the bar
-
-```
-omarchy plugin bar add port-forward
-omarchy plugin bar remove port-forward
-```
+`on` is "ensure running": it leaves an already-active tunnel alone.
+`toggleForward` flips it either way.
 
 ## Files
 
